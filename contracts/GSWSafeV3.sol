@@ -48,9 +48,13 @@ contract GSWSafeV3 {
         address owner;   // which owner this delegate acts for
         uint256 nonce;   // valid only for this exact nonce
         uint256 expiry;  // unix timestamp deadline
+        uint256 setAt;   // contract nonce when this delegation was created (zombie guard)
     }
     mapping(address => Delegation) public delegationOf;                    // delegate → Delegation
     mapping(address => mapping(uint256 => address)) private _delegateForNonce; // owner → nonce → delegate
+    // Tracks the contract nonce at which an owner most recently became an owner.
+    // Used to invalidate delegations created during a prior tenure (zombie delegation guard).
+    mapping(address => uint256) public ownerSinceNonce;                   // owner → nonce of their current tenure start
 
     uint256 private immutable _CACHED_CHAIN_ID;
     bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;
@@ -58,6 +62,9 @@ contract GSWSafeV3 {
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
     uint256 private constant MAX_DEADLINE_DURATION = 30 days;
+    // Cap on inactivityBlocks to prevent arithmetic overflow in the backup activation check.
+    // type(uint64).max blocks at BSC's ~0.75s/block ≈ 440 billion years — effectively unlimited.
+    uint256 private constant MAX_INACTIVITY_BLOCKS = type(uint64).max;
     // Deployer-supplied minimum inactivity window. Recommended: 3_456_000 on BSC (~0.75s blocks, 30 days).
     uint256 public immutable MIN_INACTIVITY_BLOCKS;
 
@@ -76,8 +83,17 @@ contract GSWSafeV3 {
     bytes32 public constant CANCEL_NONCE_TYPEHASH = keccak256(
         "CancelNonce(uint256 nonce)"
     );
+    bytes32 public constant ERC721_ASSET_TYPEHASH = keccak256(
+        "ERC721Asset(address token,uint256 tokenId)"
+    );
+    bytes32 public constant ERC1155_ASSET_TYPEHASH = keccak256(
+        "ERC1155Asset(address token,uint256[] ids)"
+    );
+    // Referenced types appended alphabetically per EIP-712 spec.
     bytes32 public constant MIGRATE_TYPEHASH = keccak256(
-        "Migrate(address to,bytes32 erc20sHash,bytes32 erc721sHash,bytes32 erc1155sHash,uint256 nonce,uint256 deadline)"
+        "Migrate(address to,address[] erc20s,ERC721Asset[] erc721s,ERC1155Asset[] erc1155s,uint256 nonce,uint256 deadline)"
+        "ERC1155Asset(address token,uint256[] ids)"
+        "ERC721Asset(address token,uint256 tokenId)"
     );
 
     // ==================== EVENTS ====================
@@ -140,6 +156,7 @@ contract GSWSafeV3 {
             owners.push(owner);
             ownerIndex[owner] = owners.length; // 1-based
             lastActiveBlock[owner] = block.number;
+            ownerSinceNonce[owner] = 0; // initial owners have been owners since nonce 0
             emit OwnerAdded(owner);
             unchecked { ++i; }
         }
@@ -246,11 +263,12 @@ contract GSWSafeV3 {
             backupFor[owner] = address(0);
         }
 
-        // Prevent adding an address that holds an active delegation from a current owner
+        // Prevent adding an address that holds an active (non-expired) delegation from a current owner
         Delegation storage existingDelegation = delegationOf[owner];
         if (existingDelegation.owner != address(0)) {
-            if (isOwner[existingDelegation.owner]) revert InvalidOwner();
-            // Stale entry (principal was removed) — clean up
+            bool isActiveDelegation = isOwner[existingDelegation.owner] && existingDelegation.nonce >= nonce;
+            if (isActiveDelegation) revert InvalidOwner();
+            // Stale entry (principal was removed, or delegation nonce has passed) — clean up
             delete _delegateForNonce[existingDelegation.owner][existingDelegation.nonce];
             delete delegationOf[owner];
         }
@@ -272,6 +290,7 @@ contract GSWSafeV3 {
         owners.push(owner);
         ownerIndex[owner] = owners.length;
         lastActiveBlock[owner] = block.number;
+        ownerSinceNonce[owner] = nonce; // record tenure start nonce for zombie delegation guard
         ownerCount = newCount;
         emit OwnerAdded(owner);
 
@@ -389,9 +408,9 @@ contract GSWSafeV3 {
         bytes32 structHash = keccak256(abi.encode(
             MIGRATE_TYPEHASH,
             to,
-            keccak256(abi.encode(erc20s)),
-            keccak256(abi.encode(erc721s)),
-            keccak256(abi.encode(erc1155s)),
+            _hashAddressArray(erc20s),
+            _hashERC721Assets(erc721s),
+            _hashERC1155Assets(erc1155s),
             currentNonce,
             deadline
         ));
@@ -401,11 +420,17 @@ contract GSWSafeV3 {
 
         nonce = currentNonce + 1;
 
-        // Native BNB
+        // Native BNB — best-effort: if `to` cannot receive BNB (no receive/fallback),
+        // skip rather than bricking all ERC-20/721/1155 transfers in the same call.
         uint256 bnbAmount = address(this).balance;
+        uint256 bnbSent;
         if (bnbAmount > 0) {
-            (bool ok,) = to.call{value: bnbAmount}("");
-            if (!ok) revert ExecutionFailed();
+            (bool ok,) = to.call{value: bnbAmount, gas: 2300}("");
+            if (ok) {
+                bnbSent = bnbAmount;
+            }
+            // If BNB send failed, `to` likely cannot receive native tokens.
+            // Remaining ERC-20/721/1155 transfers proceed. Drain BNB separately via execute().
         }
 
         // ERC-20 tokens — transfer full balance of each
@@ -430,16 +455,18 @@ contract GSWSafeV3 {
         for (uint256 i = 0; i < len;) {
             ERC1155Asset calldata asset = erc1155s[i];
             uint256 idsLen = asset.ids.length;
-            uint256[] memory amounts = new uint256[](idsLen);
-            for (uint256 j = 0; j < idsLen;) {
-                amounts[j] = IERC1155Minimal(asset.token).balanceOf(address(this), asset.ids[j]);
-                unchecked { ++j; }
+            if (idsLen > 0) {
+                uint256[] memory amounts = new uint256[](idsLen);
+                for (uint256 j = 0; j < idsLen;) {
+                    amounts[j] = IERC1155Minimal(asset.token).balanceOf(address(this), asset.ids[j]);
+                    unchecked { ++j; }
+                }
+                IERC1155Minimal(asset.token).safeBatchTransferFrom(address(this), to, asset.ids, amounts, "");
             }
-            IERC1155Minimal(asset.token).safeBatchTransferFrom(address(this), to, asset.ids, amounts, "");
             unchecked { ++i; }
         }
 
-        emit Migrated(to, bnbAmount, currentNonce);
+        emit Migrated(to, bnbSent, currentNonce);
     }
 
     // ==================== BACKUP WALLET ====================
@@ -450,8 +477,17 @@ contract GSWSafeV3 {
         if (!isOwner[msg.sender]) revert NotOwner();
         if (backup == address(0)) revert ZeroAddress();
         if (isOwner[backup]) revert InvalidBackup();                    // backup cannot already be an owner
-        if (delegationOf[backup].owner != address(0)) revert InvalidBackup(); // backup cannot be an active delegate
-        if (_inactivityBlocks < MIN_INACTIVITY_BLOCKS) revert InvalidBackup();
+        if (_inactivityBlocks < MIN_INACTIVITY_BLOCKS || _inactivityBlocks > MAX_INACTIVITY_BLOCKS) revert InvalidBackup();
+
+        // backup cannot be an active delegate; stale entries (principal removed or nonce expired) are cleaned up
+        Delegation storage existingDel = delegationOf[backup];
+        if (existingDel.owner != address(0)) {
+            bool isActiveDelegation = isOwner[existingDel.owner] && existingDel.nonce >= nonce;
+            if (isActiveDelegation) revert InvalidBackup();
+            // Stale delegation — clean up
+            delete _delegateForNonce[existingDel.owner][existingDel.nonce];
+            delete delegationOf[backup];
+        }
         address currentOccupant = backupFor[backup];
         if (currentOccupant != address(0) && currentOccupant != msg.sender) revert InvalidBackup(); // already another owner's backup
 
@@ -503,8 +539,10 @@ contract GSWSafeV3 {
         // Exception: if the previous owner was removed, the stale entry is cleared and overwritten.
         Delegation storage existing = delegationOf[delegate];
         if (existing.owner != address(0) && existing.owner != msg.sender) {
-            if (isOwner[existing.owner]) revert InvalidDelegation();
-            // Previous principal was removed — clean up their stale nonce pointer
+            // Allow overwrite only if the previous owner was removed, or their delegation
+            // nonce has already been passed (expired by nonce progression).
+            if (isOwner[existing.owner] && existing.nonce >= nonce) revert InvalidDelegation();
+            // Clean up the stale nonce pointer for the previous principal
             delete _delegateForNonce[existing.owner][existing.nonce];
         }
 
@@ -521,7 +559,7 @@ contract GSWSafeV3 {
             emit DelegateRevoked(msg.sender, oldDelegate);
         }
 
-        delegationOf[delegate] = Delegation({ owner: msg.sender, nonce: _nonce, expiry: expiry });
+        delegationOf[delegate] = Delegation({ owner: msg.sender, nonce: _nonce, expiry: expiry, setAt: nonce });
         _delegateForNonce[msg.sender][_nonce] = delegate;
         lastActiveBlock[msg.sender] = block.number;
 
@@ -572,6 +610,8 @@ contract GSWSafeV3 {
         inactivityBlocks[oldOwner] = 0;
         lastActiveBlock[oldOwner] = 0;
         lastActiveBlock[newOwner] = block.number;
+        // nonce+1 is the nonce after the activating transaction completes
+        ownerSinceNonce[newOwner] = nonce + 1;
 
         emit OwnerRemoved(oldOwner);
         emit OwnerAdded(newOwner);
@@ -615,9 +655,13 @@ contract GSWSafeV3 {
                 address dOwner = delegationOf[signer].owner;
                 uint256 dNonce = delegationOf[signer].nonce;
                 uint256 dExpiry = delegationOf[signer].expiry;
+                uint256 dSetAt = delegationOf[signer].setAt;
                 if (dOwner == address(0) || !isOwner[dOwner]) revert NotOwner();
                 if (dNonce != currentNonce) revert DelegationNonceMismatch();
                 if (block.timestamp > dExpiry) revert DelegationExpired();
+                // Zombie guard: reject delegations created before the owner's current tenure.
+                // Prevents a delegation set during a prior tenure from reviving after re-addition.
+                if (dSetAt < ownerSinceNonce[dOwner]) revert InvalidDelegation();
                 effective = dOwner;
                 // Auto-clear after single use
                 delete _delegateForNonce[dOwner][dNonce];
@@ -637,6 +681,78 @@ contract GSWSafeV3 {
             address bSigner = pendingBackupSigners[j];
             _activateBackup(backupFor[bSigner], bSigner);
             unchecked { ++j; }
+        }
+    }
+
+    // ==================== EIP-712 HASH HELPERS ====================
+
+    /// @dev EIP-712 encoding of address[]: keccak256(pad32(a1) || pad32(a2) || ...)
+    ///      abi.encodePacked on address[] gives 20-byte elements (wrong); we must pad each to 32.
+    function _hashAddressArray(address[] calldata arr) internal pure returns (bytes32 result) {
+        uint256 len = arr.length;
+        bytes32[] memory words = new bytes32[](len);
+        for (uint256 i = 0; i < len;) {
+            words[i] = bytes32(uint256(uint160(arr[i])));
+            unchecked { ++i; }
+        }
+        assembly {
+            result := keccak256(add(words, 32), mul(len, 32))
+        }
+    }
+
+    /// @dev EIP-712 encoding of a single ERC721Asset struct.
+    function _hashERC721Asset(ERC721Asset calldata asset) internal pure returns (bytes32) {
+        return keccak256(abi.encode(ERC721_ASSET_TYPEHASH, asset.token, asset.tokenId));
+    }
+
+    /// @dev EIP-712 encoding of ERC721Asset[]: keccak256(enc(a1) || enc(a2) || ...)
+    function _hashERC721Assets(ERC721Asset[] calldata arr) internal pure returns (bytes32 result) {
+        uint256 len = arr.length;
+        bytes32[] memory items = new bytes32[](len);
+        for (uint256 i = 0; i < len;) {
+            items[i] = _hashERC721Asset(arr[i]);
+            unchecked { ++i; }
+        }
+        assembly {
+            result := keccak256(add(items, 32), mul(len, 32))
+        }
+    }
+
+    /// @dev EIP-712 encoding of uint256[]: keccak256(v1 || v2 || ...)
+    ///      uint256 elements are natively 32 bytes, so bytes32(v) is identity — no padding needed.
+    ///      Uses an explicit loop rather than abi.encodePacked(arr) to avoid potential compiler
+    ///      restrictions on calldata dynamic arrays inside structs.
+    function _hashUint256Array(uint256[] calldata arr) internal pure returns (bytes32 result) {
+        uint256 len = arr.length;
+        bytes32[] memory words = new bytes32[](len);
+        for (uint256 i = 0; i < len;) {
+            words[i] = bytes32(arr[i]);
+            unchecked { ++i; }
+        }
+        assembly {
+            result := keccak256(add(words, 32), mul(len, 32))
+        }
+    }
+
+    /// @dev EIP-712 encoding of a single ERC1155Asset struct.
+    function _hashERC1155Asset(ERC1155Asset calldata asset) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            ERC1155_ASSET_TYPEHASH,
+            asset.token,
+            _hashUint256Array(asset.ids)
+        ));
+    }
+
+    /// @dev EIP-712 encoding of ERC1155Asset[]: keccak256(enc(a1) || enc(a2) || ...)
+    function _hashERC1155Assets(ERC1155Asset[] calldata arr) internal pure returns (bytes32 result) {
+        uint256 len = arr.length;
+        bytes32[] memory items = new bytes32[](len);
+        for (uint256 i = 0; i < len;) {
+            items[i] = _hashERC1155Asset(arr[i]);
+            unchecked { ++i; }
+        }
+        assembly {
+            result := keccak256(add(items, 32), mul(len, 32))
         }
     }
 
@@ -679,7 +795,7 @@ contract GSWSafeV3 {
         return keccak256(abi.encode(
             keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
             keccak256("GSWSafe"),
-            keccak256("2"),
+            keccak256("3"),
             block.chainid,
             address(this)
         ));
@@ -724,6 +840,24 @@ contract GSWSafeV3 {
 
     function getCancelNonceHash() external view returns (bytes32) {
         return _hashTypedData(keccak256(abi.encode(CANCEL_NONCE_TYPEHASH, nonce)));
+    }
+
+    function getMigrateHash(
+        address to,
+        uint256 deadline,
+        address[] calldata erc20s,
+        ERC721Asset[] calldata erc721s,
+        ERC1155Asset[] calldata erc1155s
+    ) external view returns (bytes32) {
+        return _hashTypedData(keccak256(abi.encode(
+            MIGRATE_TYPEHASH,
+            to,
+            _hashAddressArray(erc20s),
+            _hashERC721Assets(erc721s),
+            _hashERC1155Assets(erc1155s),
+            nonce,
+            deadline
+        )));
     }
 
     function getOwners() external view returns (address[] memory) {
