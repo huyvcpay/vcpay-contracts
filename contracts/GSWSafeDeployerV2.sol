@@ -11,7 +11,7 @@ interface IERC20 {
     ) external returns (bool);
 }
 
-contract GSWSafeDeployer {
+contract GSWSafeDeployerV2 {
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -148,7 +148,7 @@ contract GSWSafeDeployer {
     function withdrawETH() external whenPaused onlyAdmin {
         uint256 balance = address(this).balance;
         if (balance == 0) revert TransferFailed();
-        (bool sent, ) = fundsReceiver.call{value: balance}("");
+        (bool sent, ) = fundsReceiver.call{value: balance, gas: 2300}("");
         if (!sent) revert TransferFailed();
     }
 
@@ -291,7 +291,7 @@ contract GSWSafeDeployer {
         address receiver = fundsReceiver;
         if (currency == address(0)) {
             if (msg.value != amount) revert WrongPayment();
-            (bool sent, ) = receiver.call{value: amount}("");
+            (bool sent, ) = receiver.call{value: amount, gas: 2300}("");
             if (!sent) revert TransferFailed();
         } else {
             if (msg.value != 0) revert WrongPayment();
